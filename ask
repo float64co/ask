@@ -155,6 +155,10 @@ def search(query: str) -> str:
         return f"search failed: {e}"
     if not results:
         return "no results"
+    for r in results:
+        if r.get("href"):
+            print(" • " + r["href"], flush=True)
+    print("")
     return "\n\n".join(
         f"{r.get('title','')}\n{r.get('href','')}\n{r.get('body','')}" for r in results
     )
@@ -247,7 +251,7 @@ def run(client, model, messages):
                 if msg.content:
                     content += msg.content
                     if live:
-                        live.update(Markdown(content))
+                        live.update(Markdown(content, hyperlinks=False))
                     else:
                         sys.stdout.write(msg.content)
                         sys.stdout.flush()
