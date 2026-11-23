@@ -1,0 +1,379 @@
+#!/usr/bin/python3
+"""ask - query a local ollama model from the shell.
+
+    somecommand | ask What's going on here?
+    ask what's going on in the news? do a web search
+    ask -i                # interactive REPL (also: cmd | ask -i <question>)
+    ask --configure
+
+Config:   ~/.config/ask/ask.conf          (model = <name>)
+Prompt:   ~/.config/ask/systemprompt.txt  (created with a default if missing)
+"""
+import datetime
+import json
+import os
+import sys
+from pathlib import Path
+
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ask"
+CONF_FILE = CONF_DIR / "ask.conf"
+PROMPT_FILE = CONF_DIR / "systemprompt.txt"
+
+DEFAULT_SYSTEM_PROMPT = """\
+You are a concise, helpful assistant running in a Linux terminal.
+Output is rendered as markdown in a terminal. Keep answers short unless asked for detail.
+You have two tools: `search` (DuckDuckGo web search) and `web_fetch` (fetch a URL as text).
+Use them whenever the question involves current events, recent information, or anything you are unsure about.
+Search first, then fetch the most relevant pages if the snippets are not enough, and cite the URLs you used.
+Today's date is $date.
+If input was piped in, it is the output of a command the user is asking about.
+"""
+
+MAX_STDIN_CHARS = 200_000
+MAX_FETCH_CHARS = 12_000
+MAX_TOOL_ROUNDS = 8
+SEARCH_RESULTS = 5
+NUM_CTX = int(os.environ.get("ASK_NUM_CTX", 16384))
+
+
+def err(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- config
+
+def read_model():
+    try:
+        for line in CONF_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() == "model" and v.strip():
+                    return v.strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def write_model(model):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    CONF_FILE.write_text(f"model = {model}\n")
+
+
+def read_system_prompt():
+    if not PROMPT_FILE.exists():
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        PROMPT_FILE.write_text(DEFAULT_SYSTEM_PROMPT)
+    text = PROMPT_FILE.read_text().strip()
+    return text.replace("$date", datetime.date.today().isoformat())
+
+
+def fmt_size(b):
+    if not b:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1000 or unit == "GB":
+            return f"{b:.1f} {unit}" if unit in ("GB", "MB") else f"{b:.0f} {unit}"
+        b /= 1000
+
+
+def list_models(client):
+    """All installed models as (name, size, supports_tools)."""
+    listed = {m.model: m.size for m in client.list().models}
+    usable = []
+    for n in sorted(listed):
+        try:
+            caps = client.show(n).capabilities or []
+        except Exception:
+            caps = ["tools"]  # can't tell; assume yes
+        usable.append((n, listed[n], "tools" in caps))
+    return usable
+
+
+def choose_model(client, current=None):
+    try:
+        models = list_models(client)
+    except Exception as e:
+        err(f"ask: can't reach ollama: {e}")
+        sys.exit(1)
+    if not models:
+        err("ask: no installed ollama models. Try `ollama pull qwen3`.")
+        sys.exit(1)
+
+    if sys.stdin.isatty():
+        tty = sys.stdin
+        out = sys.stderr
+    else:
+        try:
+            tty = open("/dev/tty", "r+")  # stdin is a pipe; ask on the terminal
+        except OSError:
+            err("ask: no terminal available to select a model; edit " + str(CONF_FILE))
+            sys.exit(1)
+        out = tty
+
+    print("Select a model:", file=out)
+    names = [m[0] for m in models]
+    width = max(len(m) for m in names)
+    for i, (m, size, tools) in enumerate(models, 1):
+        mark = "  (current)" if m == current else ""
+        if not tools:
+            mark += "  (no tool support)"
+        print(f"  {i:2}) {m:<{width}}  {fmt_size(size):>8}{mark}", file=out)
+    while True:
+        print("Number: ", end="", file=out, flush=True)
+        line = tty.readline()
+        if not line:
+            sys.exit(1)
+        line = line.strip()
+        if line.isdigit() and 1 <= int(line) <= len(models):
+            choice = names[int(line) - 1]
+            break
+        if line in names:
+            choice = line
+            break
+        print("Invalid choice.", file=out)
+    write_model(choice)
+    err(f"ask: default model set to {choice} ({CONF_FILE})")
+    return choice
+
+
+# ---------------------------------------------------------------- tools
+
+def search(query: str) -> str:
+    """Search the web with DuckDuckGo.
+
+    Args:
+        query: The search query.
+    """
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+    try:
+        results = DDGS().text(query, max_results=SEARCH_RESULTS)
+    except Exception as e:
+        return f"search failed: {e}"
+    if not results:
+        return "no results"
+    return "\n\n".join(
+        f"{r.get('title','')}\n{r.get('href','')}\n{r.get('body','')}" for r in results
+    )
+
+
+def web_fetch(url: str) -> str:
+    """Fetch a web page and return its readable text.
+
+    Args:
+        url: The full http(s) URL to fetch.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        r = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ask-cli"},
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return f"fetch failed: {e}"
+    ctype = r.headers.get("content-type", "")
+    if "html" in ctype or "xml" in ctype:
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "noscript", "nav", "footer", "header", "svg", "form"]):
+            t.decompose()
+        text = soup.get_text("\n")
+        text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+    elif ctype.startswith("text/") or "json" in ctype:
+        text = r.text
+    else:
+        return f"unsupported content type: {ctype}"
+    if len(text) > MAX_FETCH_CHARS:
+        text = text[:MAX_FETCH_CHARS] + "\n[truncated]"
+    return text
+
+
+TOOLS = {"search": search, "web_fetch": web_fetch}
+
+
+# ---------------------------------------------------------------- chat
+
+# Render markdown only when writing to a terminal; piped output stays raw.
+RENDER = sys.stdout.isatty()
+if RENDER:
+    from rich.console import Console
+    console = Console()
+
+
+def _chain(first, rest):
+    if first is not None:
+        yield first
+    yield from rest
+
+
+def run(client, model, messages):
+    """Run one user turn (messages already ends with it); appends the reply."""
+    for _ in range(MAX_TOOL_ROUNDS + 1):
+        content, calls = "", []
+        # Last round: withhold tools to force a final answer.
+        tools = list(TOOLS.values()) if _ < MAX_TOOL_ROUNDS else None
+        try:
+            stream = client.chat(model=model, messages=messages, tools=tools, stream=True,
+                                 options={"num_ctx": NUM_CTX})
+            first = next(stream, None)
+        except Exception as e:
+            if tools and "tool" in str(e).lower():
+                err(f"ask: {model} does not support tools; web search/fetch disabled")
+                TOOLS.clear()
+                tools = None
+                stream = client.chat(model=model, messages=messages, stream=True,
+                                     options={"num_ctx": NUM_CTX})
+                first = next(stream, None)
+            else:
+                raise
+        live = None
+        if RENDER:
+            from rich.live import Live
+            from rich.markdown import Markdown
+            live = Live(console=console, vertical_overflow="visible", refresh_per_second=8)
+            live.start()
+        try:
+            for chunk in _chain(first, stream):
+                msg = chunk.message
+                if msg.content:
+                    content += msg.content
+                    if live:
+                        live.update(Markdown(content))
+                    else:
+                        sys.stdout.write(msg.content)
+                        sys.stdout.flush()
+                if msg.tool_calls:
+                    calls.extend(msg.tool_calls)
+        finally:
+            if live:
+                live.stop()
+        if not RENDER and content and not content.endswith("\n"):
+            print()
+        if not calls:
+            messages.append({"role": "assistant", "content": content})
+            return
+        messages.append({"role": "assistant", "content": content, "tool_calls": calls})
+        for c in calls:
+            name, args = c.function.name, dict(c.function.arguments or {})
+            err(f"[{name}: {json.dumps(args, ensure_ascii=False)}]")
+            fn = TOOLS.get(name)
+            try:
+                out = fn(**args) if fn else f"unknown tool: {name}"
+            except Exception as e:
+                out = f"tool error: {e}"
+            messages.append({"role": "tool", "tool_name": name, "content": str(out)})
+    err("ask: gave up after too many tool rounds")
+
+
+def build_user_msg(question, piped):
+    if piped:
+        return f"Command output:\n```\n{piped.rstrip()}\n```\n\n{question or 'Explain what is going on here.'}"
+    return question
+
+
+def turn(client, model, messages, user_msg):
+    """One guarded turn. Returns False (and rolls back) if it failed or was interrupted."""
+    import ollama
+
+    mark = len(messages)
+    messages.append({"role": "user", "content": user_msg})
+    try:
+        run(client, model, messages)
+        return True
+    except KeyboardInterrupt:
+        print()
+    except ollama.ResponseError as e:
+        err(f"ask: ollama error: {e}")
+    except ConnectionError:
+        err("ask: can't connect to ollama (is `ollama serve` running?)")
+    del messages[mark:]
+    return False
+
+
+def repl(client, model, messages):
+    try:
+        import readline  # noqa: F401  (line editing + history for input())
+    except ImportError:
+        pass
+    err(f"\nask: {model} - interactive mode. /exit or Ctrl-D to quit, /clear to reset.")
+    while True:
+        try:
+            print()
+            line = input("> ").strip()
+            print()
+        except EOFError:
+            print()
+            return
+        except KeyboardInterrupt:
+            print()
+            continue
+        if not line:
+            continue
+        if line in ("/exit", "/quit", "exit", "quit"):
+            return
+        if line == "/clear":
+            del messages[1:]
+            err("ask: conversation cleared")
+            continue
+        turn(client, model, messages, line)
+
+
+def main():
+    import ollama
+
+    args = sys.argv[1:]
+    if args in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    interactive = False
+    while args and args[0] in ("-i", "--interactive"):
+        interactive = True
+        args = args[1:]
+    client = ollama.Client()
+
+    if args == ["--configure"]:
+        choose_model(client, read_model())
+        return
+
+    model = read_model()
+    if not model:
+        model = choose_model(client)
+
+    question = " ".join(args).strip()
+    piped = "" if sys.stdin.isatty() else sys.stdin.read()
+    if piped and len(piped) > MAX_STDIN_CHARS:
+        err(f"ask: input truncated to last {MAX_STDIN_CHARS} chars")
+        piped = piped[-MAX_STDIN_CHARS:]
+
+    if not question and not piped and not interactive:
+        err("usage: ask [-i] [--configure] <question>   |   cmd | ask <question>")
+        sys.exit(2)
+
+    messages = [{"role": "system", "content": read_system_prompt()}]
+
+    if interactive and not sys.stdin.isatty():
+        try:
+            sys.stdin = open("/dev/tty")  # stdin was a pipe; read the REPL from the terminal
+        except OSError:
+            err("ask: no terminal available for interactive mode")
+            sys.exit(1)
+
+    if question or piped:
+        ok = turn(client, model, messages, build_user_msg(question, piped))
+        if not interactive:
+            sys.exit(0 if ok else 1)
+    if interactive:
+        repl(client, model, messages)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+ollama>=0.6
+ddgs>=9.0
+httpx>=0.28
+beautifulsoup4>=4.12
+rich>=13
